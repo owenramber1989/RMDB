@@ -1,0 +1,464 @@
+%{
+#include "ast.h"
+#include "yacc.tab.h"
+#include <iostream>
+#include <memory>
+
+int yylex(YYSTYPE *yylval, YYLTYPE *yylloc);
+
+void yyerror(YYLTYPE *locp, const char* s) {
+    std::cerr << "Parser Error at line " << locp->first_line << " column " << locp->first_column << ": " << s << std::endl;
+}
+
+using namespace ast;
+%}
+
+// request a pure (reentrant) parser
+%define api.pure full
+// enable location in error handler
+%locations
+// enable verbose syntax error message
+%define parse.error verbose
+
+// keywords
+%token SHOW TABLES CREATE TABLE DROP DESC INSERT INTO VALUES DELETE FROM ASC ORDER BY LIMIT SUM MAX MIN COUNT AS
+WHERE UPDATE SET SELECT INT CHAR FLOAT BIGINT DATETIME INDEX AND JOIN EXIT HELP TXN_BEGIN TXN_COMMIT TXN_ABORT TXN_ROLLBACK ORDER_BY
+// non-keywords
+%token LEQ NEQ GEQ T_EOF
+
+// type-specific tokens
+%token <sv_str> IDENTIFIER VALUE_INT VALUE_DATETIME VALUE_STRING
+// %token <sv_int> VALUE_INT
+%token <sv_float> VALUE_FLOAT
+%token <sv_bigint> VALUE_BIGINT
+
+// specify types for non-terminal symbol
+%type <sv_node> stmt dbStmt ddl dml txnStmt
+%type <sv_field> field
+%type <sv_fields> fieldList
+%type <sv_type_len> type
+%type <sv_comp_op> op
+%type <sv_expr> expr
+%type <sv_val> value
+%type <sv_vals> valueList
+%type <sv_str> tbName colName NICK
+%type <sv_strs> tableList colNameList
+%type <sv_col> col
+%type <sv_cols> colList selector
+%type <sv_set_clause> setClause
+%type <sv_set_clauses> setClauses
+%type <sv_cond> condition
+%type <sv_conds> whereClause optWhereClause
+%type <sv_orderby>  order_clause
+%type <sv_orderbys> order_clauses opt_order_clause
+%type <sv_limit> opt_limit_clause
+%type <sv_orderby_dir> opt_asc_desc
+%type <sv_aggre_clause> aggreClause
+%type <sv_aggre_type> SUM MAX MIN COUNT
+
+%%
+start:
+        stmt ';'
+    {
+        parse_tree = $1;
+        YYACCEPT;
+    }
+    |   HELP
+    {
+        parse_tree = std::make_shared<Help>();
+        YYACCEPT;
+    }
+    |   EXIT
+    {
+        parse_tree = nullptr;
+        YYACCEPT;
+    }
+    |   T_EOF
+    {
+        parse_tree = nullptr;
+        YYACCEPT;
+    }
+    ;
+
+stmt:
+        dbStmt
+    |   ddl
+    |   dml
+    |   txnStmt
+    ;
+
+txnStmt:
+        TXN_BEGIN
+    {
+        $$ = std::make_shared<TxnBegin>();
+    }
+    |   TXN_COMMIT
+    {
+        $$ = std::make_shared<TxnCommit>();
+    }
+    |   TXN_ABORT
+    {
+        $$ = std::make_shared<TxnAbort>();
+    }
+    | TXN_ROLLBACK
+    {
+        $$ = std::make_shared<TxnRollback>();
+    }
+    ;
+
+dbStmt:
+        SHOW TABLES
+    {
+        $$ = std::make_shared<ShowTables>();
+    }
+    |   SHOW INDEX FROM IDENTIFIER
+    {
+        $$ = std::make_shared<ShowIndex>($4);
+    }
+    ;
+
+ddl:
+        CREATE TABLE tbName '(' fieldList ')'
+    {
+        $$ = std::make_shared<CreateTable>($3, $5);
+    }
+    |   DROP TABLE tbName
+    {
+        $$ = std::make_shared<DropTable>($3);
+    }
+    |   DESC tbName
+    {
+        $$ = std::make_shared<DescTable>($2);
+    }
+    |   CREATE INDEX tbName '(' colNameList ')'
+    {
+        $$ = std::make_shared<CreateIndex>($3, $5);
+    }
+    |   DROP INDEX tbName '(' colNameList ')'
+    {
+        $$ = std::make_shared<DropIndex>($3, $5);
+    }
+    ;
+
+dml:
+        INSERT INTO tbName VALUES '(' valueList ')'
+    {
+        $$ = std::make_shared<InsertStmt>($3, $6);
+    }
+    |   DELETE FROM tbName optWhereClause
+    {
+        $$ = std::make_shared<DeleteStmt>($3, $4);
+    }
+    |   UPDATE tbName SET setClauses optWhereClause
+    {
+        $$ = std::make_shared<UpdateStmt>($2, $4, $5);
+    }
+    |   SELECT aggreClause FROM tableList optWhereClause
+    {
+        $$ = std::make_shared<SelectStmt>($2, $4, $5);
+    }
+    |   SELECT selector FROM tableList optWhereClause opt_order_clause opt_limit_clause
+    {
+        $$ = std::make_shared<SelectStmt>($2, $4, $5, $6, $7);
+    }
+    ;
+
+fieldList:
+        field
+    {
+        $$ = std::vector<std::shared_ptr<Field>>{$1};
+    }
+    |   fieldList ',' field
+    {
+        $$.push_back($3);
+    }
+    ;
+
+colNameList:
+        colName
+    {
+        $$ = std::vector<std::string>{$1};
+    }
+    | colNameList ',' colName
+    {
+        $$.push_back($3);
+    }
+    ;
+
+field:
+        colName type
+    {
+        $$ = std::make_shared<ColDef>($1, $2);
+    }
+    ;
+
+type:
+        INT
+    {
+        $$ = std::make_shared<TypeLen>(SV_TYPE_INT, 4);
+    }
+    |   CHAR '(' VALUE_INT ')'
+    {
+        $$ = std::make_shared<TypeLen>(SV_TYPE_STRING, std::stoi($3));
+    }
+    |   FLOAT
+    {
+        $$ = std::make_shared<TypeLen>(SV_TYPE_FLOAT, sizeof(float));
+    }
+    |   BIGINT
+    {
+        $$ = std::make_shared<TypeLen>(SV_TYPE_BIGINT, 8);
+    }
+    |   DATETIME
+    {
+        $$ = std::make_shared<TypeLen>(SV_TYPE_DATETIME, 19);
+    }
+    ;
+
+valueList:
+        value
+    {
+        $$ = std::vector<std::shared_ptr<Value>>{$1};
+    }
+    |   valueList ',' value
+    {
+        $$.push_back($3);
+    }
+    ;
+
+value:
+        VALUE_INT
+    {
+        $$ = std::make_shared<IntLit>($1);
+    }
+    |   VALUE_FLOAT
+    {
+        $$ = std::make_shared<FloatLit>($1);
+    }
+    |   VALUE_STRING
+    {
+        $$ = std::make_shared<StringLit>($1);
+    }
+    |   VALUE_BIGINT
+    {
+        $$ = std::make_shared<BigintLit>($1);
+    }
+    |   VALUE_DATETIME
+    {
+        $$ = std::make_shared<DatetimeLit>($1);
+    }
+    ;
+
+condition:
+        col op expr
+    {
+        $$ = std::make_shared<BinaryExpr>($1, $2, $3);
+    }
+    ;
+
+optWhereClause:
+        /* epsilon */ { /* ignore*/ }
+    |   WHERE whereClause
+    {
+        $$ = $2;
+    }
+    ;
+
+whereClause:
+        condition 
+    {
+        $$ = std::vector<std::shared_ptr<BinaryExpr>>{$1};
+    }
+    |   whereClause AND condition
+    {
+        $$.push_back($3);
+    }
+    ;
+
+col:
+        tbName '.' colName
+    {
+        $$ = std::make_shared<Col>($1, $3);
+    }
+    |   colName
+    {
+        $$ = std::make_shared<Col>("", $1);
+    }
+    ;
+
+colList:
+        col
+    {
+        $$ = std::vector<std::shared_ptr<Col>>{$1};
+    }
+    |   colList ',' col
+    {
+        $$.push_back($3);
+    }
+    ;
+
+op:
+        '='
+    {
+        $$ = SV_OP_EQ;
+    }
+    |   '<'
+    {
+        $$ = SV_OP_LT;
+    }
+    |   '>'
+    {
+        $$ = SV_OP_GT;
+    }
+    |   NEQ
+    {
+        $$ = SV_OP_NE;
+    }
+    |   LEQ
+    {
+        $$ = SV_OP_LE;
+    }
+    |   GEQ
+    {
+        $$ = SV_OP_GE;
+    }
+    ;
+
+expr:
+        value
+    {
+        $$ = std::static_pointer_cast<Expr>($1);
+    }
+    |   col
+    {
+        $$ = std::static_pointer_cast<Expr>($1);
+    }
+    ;
+
+setClauses:
+        setClause
+    {
+        $$ = std::vector<std::shared_ptr<SetClause>>{$1};
+    }
+    |   setClauses ',' setClause
+    {
+        $$.push_back($3);
+    }
+    ;
+
+setClause:
+        colName '=' value
+    {
+        $$ = std::make_shared<SetClause>($1, $3, false);
+    }
+    |   colName '=' colName '+' value
+    {
+        $$ = std::make_shared<SetClause>($1, $5, true, true);
+    }
+    |   colName '=' colName value
+    {
+        $$ = std::make_shared<SetClause>($1, $4, true, true);
+    }
+    ;
+
+aggreClause:
+        SUM '(' col ')' AS NICK
+    {
+        $$ = std::make_shared<AggreClause>(AggregationType::SUM, $3, $6);
+    }
+    |   MAX '(' col ')' AS NICK
+    {
+        $$ = std::make_shared<AggreClause>(AggregationType::MAX, $3, $6);
+    }
+    |   MIN '(' col ')' AS NICK
+    {
+        $$ = std::make_shared<AggreClause>(AggregationType::MIN, $3, $6);
+    }
+    |   COUNT '(' col ')' AS NICK
+    {
+        $$ = std::make_shared<AggreClause>(AggregationType::COUNT, $3, $6);
+    }
+    |   COUNT '(' '*' ')' AS NICK
+    {
+        $$ = std::make_shared<AggreClause>($6);
+    }
+    ;
+
+selector:
+        '*'
+    {
+        $$ = {};
+    }
+    |   colList
+    ;
+
+tableList:
+        tbName
+    {
+        $$ = std::vector<std::string>{$1};
+    }
+    |   tableList ',' tbName
+    {
+        $$.push_back($3);
+    }
+    |   tableList JOIN tbName
+    {
+        $$.push_back($3);
+    }
+    ;
+
+opt_order_clause:
+    ORDER BY order_clauses
+    { 
+        $$ = $3; 
+    }
+    |   /* epsilon */ { /* ignore*/ }
+    ;
+
+order_clauses:
+        order_clause
+    {
+        $$ = std::vector<std::shared_ptr<OrderBy>>{$1};
+    }
+    |   order_clauses ',' order_clause
+    {
+        $$.push_back($3);
+    }
+    ;
+
+order_clause:
+      col  opt_asc_desc 
+    { 
+        $$ = std::make_shared<OrderBy>($1, $2);
+    }
+    ;   
+
+opt_asc_desc:
+        ASC
+    {
+        $$ = OrderBy_ASC;
+    }
+    |   DESC
+    {
+        $$ = OrderBy_DESC;
+    }
+    |
+    {
+        $$ = OrderBy_DEFAULT;
+    }
+    ;    
+
+opt_limit_clause:
+        /* epsilon */ { /* ignore*/ }
+    |    LIMIT VALUE_INT
+    {
+        $$ = std::make_shared<Limit>($2);
+    }
+    ;
+
+tbName: IDENTIFIER;
+
+colName: IDENTIFIER;
+
+NICK: IDENTIFIER;
+%%

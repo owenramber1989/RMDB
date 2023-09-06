@@ -1,0 +1,13 @@
+.idea/
+tpcc-generator/tpcc-generator
+build/
+cmake-build-debug/
+deps/
+rmdb_client/
+mock.db 
+in.sql
+.vscode/*
+concurrency_test/*
+db/*
+rb.out
+*csv
